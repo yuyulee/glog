@@ -98,20 +98,54 @@ type severity int32 // sync/atomic int32
 // A message written to a high-severity log file is also written to each
 // lower-severity log file.
 const (
-	infoLog severity = iota
+	debugLog severity = iota
+	infoLog
 	warningLog
 	errorLog
 	fatalLog
-	numSeverity = 4
+	numSeverity = 5
 )
 
-const severityChar = "IWEF"
-
 var severityName = []string{
+	debugLog:   "DEBU",
 	infoLog:    "INFO",
-	warningLog: "WARNING",
-	errorLog:   "ERROR",
-	fatalLog:   "FATAL",
+	warningLog: "WARN",
+	errorLog:   "ERRO",
+	fatalLog:   "FATA",
+}
+
+// 设置日志打印门槛,高于门槛打印日志到控制台
+func StderrThresholdDebug() {
+	logging.stderrThreshold = debugLog
+}
+
+func StderrThresholdInfo() {
+	logging.stderrThreshold = infoLog
+}
+
+func StderrThresholdWarning() {
+	logging.stderrThreshold = warningLog
+}
+
+func StderrThresholdError() {
+	logging.stderrThreshold = errorLog
+}
+
+// 设置日志写入门槛,高于门槛写入日志文件
+func WriteThresholdDebug() {
+	logging.writeThreshold = debugLog
+}
+
+func WriteThresholdInfo() {
+	logging.writeThreshold = infoLog
+}
+
+func WriteThresholdWarning() {
+	logging.writeThreshold = warningLog
+}
+
+func WriteThresholdError() {
+	logging.writeThreshold = errorLog
 }
 
 // get returns the value of the severity.
@@ -180,10 +214,11 @@ func (s *OutputStats) Bytes() int64 {
 // Stats tracks the number of lines of output and number of bytes
 // per severity level. Values must be read with atomic.LoadInt64.
 var Stats struct {
-	Info, Warning, Error OutputStats
+	Debug, Info, Warning, Error OutputStats
 }
 
 var severityStats = [numSeverity]*OutputStats{
+	debugLog:   &Stats.Debug,
 	infoLog:    &Stats.Info,
 	warningLog: &Stats.Warning,
 	errorLog:   &Stats.Error,
@@ -403,8 +438,8 @@ func init() {
 	flag.Var(&logging.vmodule, "vmodule", "comma-separated list of pattern=N settings for file-filtered logging")
 	flag.Var(&logging.traceLocation, "log_backtrace_at", "when logging hits line file:N, emit a stack trace")
 
-	// Default stderrThreshold is ERROR.
-	logging.stderrThreshold = errorLog
+	logging.stderrThreshold = errorLog // 默认日志打印门槛
+	logging.writeThreshold = errorLog  // 默认日志写入门槛
 
 	logging.setVState(0, nil, false)
 	go logging.flushDaemon()
@@ -425,6 +460,7 @@ type loggingT struct {
 
 	// Level flag. Handled atomically.
 	stderrThreshold severity // The -stderrthreshold flag.
+	writeThreshold  severity // 日志写入门槛,高于门槛写入日志文件
 
 	// freeList is a list of byte buffers, maintained under freeListMu.
 	freeList *buffer
@@ -559,30 +595,32 @@ func (l *loggingT) formatHeader(s severity, file string, line int) *buffer {
 
 	// Avoid Fprintf, for speed. The format is so simple that we can do it quickly by hand.
 	// It's worth about 3X. Fprintf is hard.
-	_, month, day := now.Date()
+	//year, month, day := now.Date()
 	hour, minute, second := now.Clock()
 	// Lmmdd hh:mm:ss.uuuuuu threadid file:line]
-	buf.tmp[0] = severityChar[s]
-	buf.twoDigits(1, int(month))
-	buf.twoDigits(3, day)
-	buf.tmp[5] = ' '
-	buf.twoDigits(6, hour)
-	buf.tmp[8] = ':'
-	buf.twoDigits(9, minute)
-	buf.tmp[11] = ':'
-	buf.twoDigits(12, second)
-	buf.tmp[14] = '.'
-	buf.nDigits(6, 15, now.Nanosecond()/1000, '0')
-	buf.tmp[21] = ' '
-	buf.nDigits(7, 22, pid, ' ') // TODO: should be TID
-	buf.tmp[29] = ' '
-	buf.Write(buf.tmp[:30])
+	// 格式简化 [hh:mm:ss file:line] [DEBUG INFO WARNING ERROR]
+	buf.tmp[0] = '['
+	buf.twoDigits(1, hour)
+	buf.tmp[3] = ':'
+	buf.twoDigits(4, minute)
+	buf.tmp[6] = ':'
+	buf.twoDigits(7, second)
+	buf.tmp[9] = ' '
+	buf.Write(buf.tmp[:10])
+
 	buf.WriteString(file)
 	buf.tmp[0] = ':'
 	n := buf.someDigits(1, line)
 	buf.tmp[n+1] = ']'
 	buf.tmp[n+2] = ' '
 	buf.Write(buf.tmp[:n+3])
+
+	buf.tmp[0] = '['
+	buf.Write(buf.tmp[:1])
+	buf.WriteString(severityName[s])
+	buf.tmp[0] = ']'
+	buf.tmp[1] = ' '
+	buf.Write(buf.tmp[:2])
 	return buf
 }
 
@@ -685,24 +723,27 @@ func (l *loggingT) output(s severity, buf *buffer, file string, line int, alsoTo
 		if alsoToStderr || l.alsoToStderr || s >= l.stderrThreshold.get() {
 			os.Stderr.Write(data)
 		}
-		if l.file[s] == nil {
-			if err := l.createFiles(s); err != nil {
-				os.Stderr.Write(data) // Make sure the message appears somewhere.
-				l.exit(err)
+
+		// 高于写入门槛,写入文件
+		if s >= l.writeThreshold.get() {
+			if l.file[s] == nil {
+				if err := l.createFiles(s); err != nil {
+					os.Stderr.Write(data) // Make sure the message appears somewhere.
+					l.exit(err)
+				}
 			}
-		}
-		switch s {
-		case fatalLog:
-			l.file[fatalLog].Write(data)
-			fallthrough
-		case errorLog:
-			l.file[errorLog].Write(data)
-			fallthrough
-		case warningLog:
-			l.file[warningLog].Write(data)
-			fallthrough
-		case infoLog:
-			l.file[infoLog].Write(data)
+			switch s {
+			case fatalLog:
+				l.file[fatalLog].Write(data)
+			case errorLog:
+				l.file[errorLog].Write(data)
+			case warningLog:
+				l.file[warningLog].Write(data)
+			case infoLog:
+				l.file[infoLog].Write(data)
+			case debugLog:
+				l.file[debugLog].Write(data)
+			}
 		}
 	}
 	if s == fatalLog {
@@ -802,9 +843,10 @@ func (l *loggingT) exit(err error) {
 type syncBuffer struct {
 	logger *loggingT
 	*bufio.Writer
-	file   *os.File
-	sev    severity
-	nbytes uint64 // The number of bytes written to this file
+	file       *os.File
+	sev        severity
+	nbytes     uint64 // The number of bytes written to this file
+	createDate string // 创建文件日期
 }
 
 func (sb *syncBuffer) Sync() error {
@@ -812,11 +854,17 @@ func (sb *syncBuffer) Sync() error {
 }
 
 func (sb *syncBuffer) Write(p []byte) (n int, err error) {
-	if sb.nbytes+uint64(len(p)) >= MaxSize {
-		if err := sb.rotateFile(time.Now()); err != nil {
+
+	now := timeNow()
+	nowDate := fmt.Sprintf("%02d%02d", now.Month(), now.Day())
+
+	// 根据日期分割
+	if nowDate != sb.createDate {
+		if err := sb.rotateFile(now); err != nil {
 			sb.logger.exit(err)
 		}
 	}
+
 	n, err = sb.Writer.Write(p)
 	sb.nbytes += uint64(n)
 	if err != nil {
@@ -838,16 +886,19 @@ func (sb *syncBuffer) rotateFile(now time.Time) error {
 		return err
 	}
 
+	// 创建时间
+	sb.createDate = fmt.Sprintf("%02d%02d", now.Month(), now.Day())
+
 	sb.Writer = bufio.NewWriterSize(sb.file, bufferSize)
 
 	// Write header.
 	var buf bytes.Buffer
-	fmt.Fprintf(&buf, "\n\n\n")
+	fmt.Fprintf(&buf, "\n\n")
 	fmt.Fprintf(&buf, "------------------------------------------------------------------------\n")
 	fmt.Fprintf(&buf, "Log file created at: %s\n", now.Format("2006/01/02 15:04:05"))
 	fmt.Fprintf(&buf, "Running on machine: %s\n", host)
 	fmt.Fprintf(&buf, "Binary: Built with %s %s for %s/%s\n", runtime.Compiler, runtime.Version(), runtime.GOOS, runtime.GOARCH)
-	fmt.Fprintf(&buf, "Log line format: [IWEF]mmdd hh:mm:ss.uuuuuu threadid file:line] msg\n")
+	fmt.Fprintf(&buf, "Log line format: [hh:mm:ss file:line] [DEBUG INFO WARNING ERROR] msg\n")
 	n, err := sb.file.Write(buf.Bytes())
 	sb.nbytes += uint64(n)
 	return err
@@ -862,22 +913,22 @@ const bufferSize = 256 * 1024
 // l.mu is held.
 func (l *loggingT) createFiles(sev severity) error {
 	now := time.Now()
-	// Files are created in decreasing severity order, so as soon as we find one
-	// has already been created, we can stop.
-	for s := sev; s >= infoLog && l.file[s] == nil; s-- {
+
+	// 日志文件不存在,创建文件
+	if l.file[sev] == nil {
 		sb := &syncBuffer{
 			logger: l,
-			sev:    s,
+			sev:    sev,
 		}
 		if err := sb.rotateFile(now); err != nil {
 			return err
 		}
-		l.file[s] = sb
+		l.file[sev] = sb
 	}
 	return nil
 }
 
-const flushInterval = 30 * time.Second
+const flushInterval = 5 * time.Second
 
 // flushDaemon periodically flushes the log file buffers.
 func (l *loggingT) flushDaemon() {
@@ -897,7 +948,7 @@ func (l *loggingT) lockAndFlushAll() {
 // l.mu is held.
 func (l *loggingT) flushAll() {
 	// Flush from fatal down, in case there's trouble flushing.
-	for s := fatalLog; s >= infoLog; s-- {
+	for s := fatalLog; s >= debugLog; s-- {
 		file := l.file[s]
 		if file != nil {
 			file.Flush() // ignore error
@@ -1049,6 +1100,19 @@ func (v Verbose) Infof(format string, args ...interface{}) {
 	if v {
 		logging.printf(infoLog, format, args...)
 	}
+}
+
+// 新增Debug logs
+func Debug(args ...interface{}) {
+	logging.print(debugLog, args...)
+}
+
+func Debugln(args ...interface{}) {
+	logging.println(debugLog, args...)
+}
+
+func Debugf(format string, args ...interface{}) {
+	logging.printf(debugLog, format, args...)
 }
 
 // Info logs to the INFO log.
